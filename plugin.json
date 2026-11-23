@@ -1,7 +1,7 @@
 {
   "name": "antigravity-theme",
   "displayName": "Antigravity Theme Studio · 界面美化工作室",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Google Antigravity 2.0 桌面端可视化美化插件：支持自定义本地静态/动态壁纸、通透毛玻璃（Glassmorphism）、深浅主题自适应遮罩、内置多款精选壁纸、强调色/字体与自定义 CSS 注入，兼容猫娘挂件与中文汉化补丁。",
   "logo": "assets/logo.svg",
   "suggestedPrompts": [
