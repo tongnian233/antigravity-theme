@@ -1,0 +1,13 @@
+.DS_Store
+Thumbs.db
+*.log
+*.tmp
+*.bak
+*.theme-bak
+*.theme-tmp*
+*.theme-staged*
+*.theme-lock*
+*.sha256
+theme_prefs.json
+wallpapers/custom/
+node_modules/
