@@ -96,10 +96,17 @@
       userStepIo: null,
       observedUserSteps: new WeakSet(),
       visibleUserSteps: new Set(),
+      holeRo: null,
+      observedHoles: new WeakSet(),
+      holeRafPending: false,
+      lastHoleClipKey: '',
+      hasActiveBrowserHole: false,
       learnedFadeSelectors: new Set(),
       learnedBubbleSelectors: new Set(),
       toastTimer: null
     };
+
+    const BROWSER_HOLE_SEL = '[data-browser-hole]:not([data-browser-hole="false"]):not([data-browser-hole=""])';
 
     // ---- Utilities ----
     function escapeHtml(str) {
@@ -258,11 +265,158 @@
       return false;
     }
 
+    // ---- Browser Hole Cutout (Antigravity 3-layer WCV stack compatibility) ----
+    function resetBrowserHoleCutout() {
+      if (state.holeRo) {
+        try { state.holeRo.disconnect(); } catch {}
+        state.holeRo = null;
+      }
+      state.observedHoles = new WeakSet();
+      state.hasActiveBrowserHole = false;
+      state.lastHoleClipKey = '';
+      const wrap = document.getElementById(IDS.backdrop);
+      if (wrap) {
+        wrap.style.clipPath = '';
+        wrap.style.webkitClipPath = '';
+      }
+    }
+
+    function ensureHoleResizeObserver() {
+      if (state.holeRo || typeof ResizeObserver !== 'function') return state.holeRo;
+      try {
+        state.holeRo = new ResizeObserver(() => {
+          scheduleHoleCutoutSync();
+        });
+      } catch {
+        state.holeRo = null;
+      }
+      return state.holeRo;
+    }
+
+    function scheduleHoleCutoutSync() {
+      if (state.holeRafPending) return;
+      state.holeRafPending = true;
+      const run = () => {
+        state.holeRafPending = false;
+        syncBrowserHoleCutout();
+      };
+      if (typeof requestAnimationFrame === 'function') {
+        requestAnimationFrame(run);
+      } else {
+        setTimeout(run, 16);
+      }
+    }
+
+    function syncBrowserHoleCutout() {
+      const p = state.prefs;
+      if (!p || !p.enabled) {
+        if (state.hasActiveBrowserHole || state.lastHoleClipKey) {
+          resetBrowserHoleCutout();
+        }
+        return { hasHole: false, minTop: 0, holes: [] };
+      }
+      const vw = window.innerWidth || 1280;
+      const vh = window.innerHeight || 800;
+      const wrap = document.getElementById(IDS.backdrop);
+      const holeNodes = document.querySelectorAll(BROWSER_HOLE_SEL);
+      const holes = [];
+      let minTop = Infinity;
+
+      for (let i = 0; i < holeNodes.length; i++) {
+        const el = holeNodes[i];
+        if (!el || !el.isConnected) continue;
+        let st;
+        try { st = window.getComputedStyle(el); } catch { continue; }
+        if (!st || st.display === 'none' || st.visibility === 'hidden') continue;
+        const r = el.getBoundingClientRect();
+        const l = Math.floor(Math.max(0, r.left));
+        const t = Math.floor(Math.max(0, r.top));
+        const right = Math.ceil(Math.min(vw, r.right));
+        const bottom = Math.ceil(Math.min(vh, r.bottom));
+        const w = right - l;
+        const h = bottom - t;
+        if (w < 20 || h < 20) continue;
+        holes.push({ el, l, t, r: right, b: bottom, w, h });
+        if (t < minTop) minTop = t;
+      }
+
+      if (holes.length === 0) {
+        state.hasActiveBrowserHole = false;
+        if (state.lastHoleClipKey !== '') {
+          state.lastHoleClipKey = '';
+          if (wrap) {
+            wrap.style.clipPath = '';
+            wrap.style.webkitClipPath = '';
+          }
+        }
+        return { hasHole: false, minTop: 0, holes: [] };
+      }
+
+      state.hasActiveBrowserHole = true;
+      const ro = ensureHoleResizeObserver();
+      if (ro) {
+        const watch = (node) => {
+          if (!node || state.observedHoles.has(node)) return;
+          try {
+            ro.observe(node);
+            state.observedHoles.add(node);
+          } catch {}
+        };
+        for (const h of holes) {
+          watch(h.el);
+          if (h.el.parentElement) watch(h.el.parentElement);
+        }
+        const sidebars = document.querySelectorAll('[data-ag-sidebar="1"]');
+        for (let i = 0; i < sidebars.length; i++) watch(sidebars[i]);
+      }
+
+      // Punch exact rectangular cutout(s) in #ag-theme-studio-backdrop so lowered browser WCV (zOrder=0) shines straight through
+      const pts = ['0px 0px', '100% 0px', '100% 100%', '0px 100%', '0px 0px'];
+      for (const h of holes) {
+        pts.push(
+          `${h.l}px ${h.t}px`,
+          `${h.l}px ${h.b}px`,
+          `${h.r}px ${h.b}px`,
+          `${h.r}px ${h.t}px`,
+          `${h.l}px ${h.t}px`,
+          '0px 0px'
+        );
+      }
+      const clip = `polygon(evenodd, ${pts.join(', ')})`;
+      if (wrap && clip !== state.lastHoleClipKey) {
+        state.lastHoleClipKey = clip;
+        wrap.style.clipPath = clip;
+        wrap.style.webkitClipPath = clip;
+      }
+
+      // In glass mode, guarantee hole ancestors stay pure transparent canvas (never panel/backdrop-filter or native-clash!)
+      if (p.renderMode === 'glass') {
+        for (const h of holes) {
+          let anc = h.el.parentElement;
+          for (let up = 0; anc && up < 18 && anc !== document.body && anc !== document.documentElement; up++) {
+            if (anc.getAttribute('data-ag-native-clash') === '1') {
+              anc.removeAttribute('data-ag-native-clash');
+              anc.removeAttribute('data-ag-native-surface');
+            }
+            if (!isProtectedElement(anc)) {
+              const curSurf = anc.getAttribute('data-ag-surface');
+              if (curSurf !== 'canvas') {
+                anc.setAttribute('data-ag-surface', 'canvas');
+              }
+            }
+            anc = anc.parentElement;
+          }
+        }
+      }
+
+      return { hasHole: true, minTop: Number.isFinite(minTop) ? minTop : 0, holes };
+    }
+
     // ---- Surface Scanner for Smart Glass Mode ----
     function clearSurfaceTags(keepFadeMasks) {
       const sel = keepFadeMasks
-        ? '[data-ag-surface], [data-ag-app-shell], [data-ag-sidebar], [data-ag-main-pane], [data-ag-composer-region], [data-ag-chat-root], [data-ag-native-surface], [data-ag-native-clash], [data-ag-bubble-checked], [data-ag-preserve-fg]'
-        : '[data-ag-surface], [data-ag-app-shell], [data-ag-fade-mask], [data-ag-sidebar], [data-ag-main-pane], [data-ag-composer-region], [data-ag-chat-root], [data-ag-native-surface], [data-ag-native-clash], [data-ag-bubble-checked], [data-ag-preserve-fg]';
+        ? '[data-ag-surface], [data-ag-app-shell], [data-ag-sidebar], [data-ag-main-pane], [data-ag-composer-region], [data-ag-chat-root], [data-ag-native-surface], [data-ag-native-clash], [data-ag-bubble-checked], [data-ag-preserve-fg], [data-ag-visible-input]'
+        : '[data-ag-surface], [data-ag-app-shell], [data-ag-fade-mask], [data-ag-sidebar], [data-ag-main-pane], [data-ag-composer-region], [data-ag-chat-root], [data-ag-native-surface], [data-ag-native-clash], [data-ag-bubble-checked], [data-ag-preserve-fg], [data-ag-visible-input]';
       const tagged = document.querySelectorAll(sel);
       for (const el of tagged) {
         el.removeAttribute('data-ag-surface');
@@ -276,6 +430,7 @@
         el.removeAttribute('data-ag-native-clash');
         el.removeAttribute('data-ag-bubble-checked');
         el.removeAttribute('data-ag-preserve-fg');
+        el.removeAttribute('data-ag-visible-input');
       }
       if (state.userStepIo) {
         try { state.userStepIo.disconnect(); } catch {}
@@ -283,6 +438,7 @@
       }
       state.observedUserSteps = new WeakSet();
       state.visibleUserSteps.clear();
+      resetBrowserHoleCutout();
     }
 
     function hasOpaqueSurfaceBg(el) {
@@ -327,6 +483,7 @@
       if (id === 'root' || id === 'app' || id.startsWith('ag-theme-') || id.includes('neko') || id.includes('Neko')) return false;
       if (el.closest('#ag-theme-studio-ui-root, #ag-theme-studio-trigger-root, #ag-theme-studio-backdrop, [id*="neko"], [id*="Neko"]')) return false;
       if (inputBox && (el === inputBox || el.contains(inputBox))) return false;
+      if ((el.matches && el.matches(BROWSER_HOLE_SEL)) || el.querySelector(BROWSER_HOLE_SEL)) return false;
       if (el.querySelector('[data-testid="conversation-view"], [data-testid="agent-input-box"], [data-testid="planner-response-text"]')) return false;
       if (el.getAttribute('data-ag-sidebar') === '1' || el.getAttribute('data-ag-surface') === 'panel' || el.getAttribute('data-ag-surface') === 'canvas') return false;
 
@@ -367,6 +524,15 @@
       for (let i = 0; i < qLim; i++) candidates.add(queryNodes[i]);
 
       const nextOverlays = new Set();
+
+      // Always protect embedded code editors & terminals (syntax highlighting / ANSI colors must stay native)
+      const nativeEditors = document.querySelectorAll('.monaco-editor, .cm-editor, .xterm');
+      for (let i = 0; i < Math.min(nativeEditors.length, 24); i++) {
+        const ed = nativeEditors[i];
+        if (!ed || !ed.isConnected) continue;
+        if (ed.closest('#ag-theme-studio-ui-root, #ag-theme-studio-trigger-root, [id*="neko"], [id*="Neko"]')) continue;
+        nextOverlays.add(ed);
+      }
 
       for (const el of candidates) {
         let ancMatched = false;
@@ -421,6 +587,7 @@
             if (el.getAttribute('data-ag-native-surface') === '1' && el.getAttribute('data-ag-native-clash') !== '1') continue;
             if (el.closest('[data-ag-sidebar="1"], [data-ag-surface="panel"], [data-ag-surface="input-card"], [data-ag-surface="user-bubble"], pre, code, #ag-theme-studio-ui-root, #ag-theme-studio-trigger-root, [id*="neko"]')) continue;
             if (inputBox && (el === inputBox || el.contains(inputBox))) continue;
+            if ((el.matches && el.matches(BROWSER_HOLE_SEL)) || el.querySelector(BROWSER_HOLE_SEL)) continue;
             const r = el.getBoundingClientRect();
             if (r.width < 140 || r.height < 72) continue;
             if (el.querySelector('[data-testid="conversation-view"], [data-testid="agent-input-box"], [data-testid="planner-response-text"]')) continue;
@@ -666,17 +833,19 @@
     // Incrementally prune only stale structural tags whose geometry no longer matches, avoiding backdrop-filter layer teardown!
     function pruneStaleStructuralTags(vw, vh) {
       const inputBox = document.querySelector('[data-testid="agent-input-box"]');
+      const minCanvasW = Math.max(180, vw * 0.18);
       const canvases = document.querySelectorAll('[data-ag-surface="canvas"]');
       for (const el of canvases) {
         if (inputBox && el.contains(inputBox)) continue;
+        if ((el.matches && el.matches(BROWSER_HOLE_SEL)) || el.querySelector(BROWSER_HOLE_SEL)) continue;
         const r = el.getBoundingClientRect();
-        if (r.width < vw * 0.32 || r.height < vh * 0.24) {
+        if (r.width < minCanvasW || r.height < vh * 0.24) {
           el.removeAttribute('data-ag-surface');
         }
       }
       const panels = document.querySelectorAll('[data-ag-surface="panel"]');
       for (const el of panels) {
-        if (inputBox && el.contains(inputBox)) {
+        if ((inputBox && el.contains(inputBox)) || el.querySelector(BROWSER_HOLE_SEL)) {
           el.setAttribute('data-ag-surface', 'canvas');
           el.removeAttribute('data-ag-sidebar');
           continue;
@@ -688,6 +857,13 @@
         if (!validSide && !validTop) {
           el.removeAttribute('data-ag-surface');
           el.removeAttribute('data-ag-sidebar');
+        }
+      }
+      const headerTagged = document.querySelectorAll('[data-ag-surface="header-clean"], [data-ag-surface="header-pill"]');
+      for (const el of headerTagged) {
+        const r = el.getBoundingClientRect();
+        if (r.height > 152 || r.top > 180) {
+          el.removeAttribute('data-ag-surface');
         }
       }
     }
@@ -921,67 +1097,210 @@
       return inputBox;
     }
 
-    function scanHeaderClean(rootEl, vw) {
+    function scanHeaderClean(rootEl, vw, isGlassArg, holeInfoArg) {
       if (!rootEl) return;
+      const p = state.prefs;
+      const isGlass = isGlassArg !== undefined ? Boolean(isGlassArg) : Boolean(p && p.enabled && p.renderMode === 'glass');
+      const holeInfo = holeInfoArg || (isGlass && state.hasActiveBrowserHole ? syncBrowserHoleCutout() : null);
+      const browserHoleTop = holeInfo && holeInfo.hasHole && holeInfo.minTop >= 48 ? holeInfo.minTop : 0;
+      const maxHeaderBottom = isGlass
+        ? Math.min(180, Math.max(128, browserHoleTop ? browserHoleTop + 6 : 128))
+        : 112;
+      const maxStripHeight = isGlass
+        ? Math.min(140, Math.max(96, browserHoleTop ? browserHoleTop + 4 : 96))
+        : 68;
+
       const seen = new Set();
       const candidates = [];
-      const addAll = (list, cap) => {
-        const lim = Math.min(list.length, cap);
-        for (let i = 0; i < lim; i++) {
-          const el = list[i];
-          if (!seen.has(el)) { seen.add(el); candidates.push(el); }
-        }
+      const addNode = (el) => {
+        if (!el || el.nodeType !== 1 || el === document.body || el === document.documentElement) return;
+        if (!seen.has(el)) { seen.add(el); candidates.push(el); }
       };
-      // Prefer targeted header / topbar containers + O(1) elementsFromPoint hit-test on top-right controls (catches any DOM depth!)
-      addAll(rootEl.querySelectorAll('header, header *, nav, [role="banner"], [role="banner"] *, [class*="top-0"], [class*="header" i]'), 220);
-      addAll(rootEl.querySelectorAll(':scope > div, :scope > div > div, :scope > div > div > div, :scope > div > div > div > button'), 120);
+      const addAll = (list, cap) => {
+        if (!list) return;
+        const lim = Math.min(list.length, cap);
+        for (let i = 0; i < lim; i++) addNode(list[i]);
+      };
+
+      // Temporarily clear existing header-pill & visible-input tags so switching tabs or reading native input opacity is exact in one synchronous pass
+      const prevPills = isGlass ? Array.from(rootEl.querySelectorAll('[data-ag-surface="header-pill"]')) : [];
+      for (const pill of prevPills) {
+        pill.removeAttribute('data-ag-surface');
+        addNode(pill);
+      }
+      const prevVisibleInputs = isGlass ? Array.from(rootEl.querySelectorAll('[data-ag-visible-input="1"]')) : [];
+      for (const inp of prevVisibleInputs) {
+        inp.removeAttribute('data-ag-visible-input');
+        addNode(inp);
+      }
+
+      // Prefer targeted header / topbar / tabbar containers + O(1) elementsFromPoint hit-test across all top chrome rows!
+      addAll(
+        rootEl.querySelectorAll(
+          'header, header *, nav, [role="banner"], [role="banner"] *, [role="tablist"], [role="tablist"] *, [role="tab"], [class*="top-0"], [class*="header" i], [class*="titlebar" i], [class*="tab-bar" i], [class*="tabbar" i]'
+        ),
+        280
+      );
+      addAll(rootEl.querySelectorAll(':scope > div, :scope > div > div, :scope > div > div > div, :scope > div > div > div > button'), 140);
+
       if (typeof document.elementsFromPoint === 'function') {
         const probePts = [
           [vw - 20, 48], [vw - 56, 48], [vw - 100, 48],
           [vw - 20, 62], [vw - 56, 62], [vw - 100, 62]
         ];
+        if (isGlass) {
+          // Row 1: Window Title Bar ("Antigravity 工作区 视图 窗口" + controls)
+          probePts.push(
+            [Math.round(vw * 0.08), 16],
+            [Math.round(vw * 0.25), 16],
+            [Math.round(vw * 0.50), 16],
+            [Math.round(vw * 0.78), 16],
+            [Math.max(24, vw - 160), 16]
+          );
+          // Row 2: Chat Header & Right Side Pane Tab Bar
+          probePts.push(
+            [Math.round(vw * 0.22), 48],
+            [Math.round(vw * 0.32), 48],
+            [Math.round(vw * 0.45), 48],
+            [Math.round(vw * 0.62), 48],
+            [Math.round(vw * 0.80), 48],
+            [Math.round(vw * 0.60), 88],
+            [Math.round(vw * 0.82), 88]
+          );
+          // Row 3 (Dynamic): Built-in Browser URL Bar & Tab Bar directly above [data-browser-hole]
+          if (holeInfo && holeInfo.hasHole && Array.isArray(holeInfo.holes)) {
+            for (const h of holeInfo.holes) {
+              if (h.t >= 48 && h.t <= 220) {
+                const yUrl = Math.max(8, h.t - 20);
+                const yTab = Math.max(8, h.t - 56);
+                const xs = [
+                  Math.round(h.l + 28),
+                  Math.round(h.l + 96),
+                  Math.round(h.l + h.w * 0.35),
+                  Math.round(h.l + h.w * 0.65),
+                  Math.round(h.r - 36),
+                  Math.round(h.r - 6)
+                ];
+                for (const px of xs) {
+                  probePts.push([px, yUrl], [px, yTab]);
+                }
+              }
+            }
+          }
+        }
         for (const [px, py] of probePts) {
-          if (px <= 0 || py <= 0) continue;
+          if (px <= 0 || py <= 0 || px >= vw) continue;
           try {
             const stack = document.elementsFromPoint(px, py);
             for (const el of stack) {
-              if (!el || el === document.body || el === document.documentElement) continue;
-              if (!seen.has(el)) { seen.add(el); candidates.push(el); }
-              // Also inspect immediate parent wrapper of top-right buttons (often carries the opaque black strip!)
-              const pe = el.parentElement;
-              if (pe && pe !== document.body && !seen.has(pe)) { seen.add(pe); candidates.push(pe); }
+              addNode(el);
+              if (el && el.parentElement) addNode(el.parentElement);
             }
           } catch {}
         }
       }
 
+      // Also inspect direct top chrome siblings sitting immediately above active [data-browser-hole]
+      if (isGlass && holeInfo && holeInfo.hasHole && Array.isArray(holeInfo.holes)) {
+        for (const h of holeInfo.holes) {
+          let cur = h.el;
+          for (let up = 0; cur && up < 4 && cur !== document.body; up++) {
+            const parent = cur.parentElement;
+            if (!parent || parent === document.body) break;
+            for (const sib of Array.from(parent.children)) {
+              if (sib === cur || sib.contains(cur) || isProtectedElement(sib)) continue;
+              const sr = sib.getBoundingClientRect();
+              if (sr.bottom <= h.t + 8 && sr.height >= 16 && sr.height <= maxStripHeight) {
+                addNode(sib);
+                addAll(sib.querySelectorAll('div, form, nav, header, button, input, [role="tab"], [role="tablist"]'), 60);
+              }
+            }
+            cur = parent;
+          }
+        }
+      }
+
       const writes = [];
+      const preserveFg = [];
+      const visibleInputs = [];
       for (const el of candidates) {
         if (isProtectedElement(el)) continue;
+        if (el.getAttribute('data-ag-surface') === 'panel' || el.getAttribute('data-ag-surface') === 'header-clean') continue;
+        if (el.closest('[data-ag-sidebar="1"], [data-ag-surface="input-card"], [data-ag-surface="user-bubble"], [data-testid="conversation-view"], [data-testid="agent-input-box"]')) {
+          continue;
+        }
+        if ((el.matches && el.matches(BROWSER_HOLE_SEL)) || el.querySelector('[data-testid="conversation-view"], [data-testid="agent-input-box"], [data-browser-hole], .monaco-editor, .cm-editor, .xterm')) {
+          continue;
+        }
         const r = el.getBoundingClientRect();
-        if (r.top > 96 || r.bottom > 112 || r.height < 14 || r.height > 68 || r.width < 16 || r.width > vw * 0.48) continue;
+        if (r.top < -4 || r.top > maxHeaderBottom - 8 || r.bottom > maxHeaderBottom || r.height < 14 || r.height > maxStripHeight || r.width < 16) continue;
+        if (!isGlass && r.width > vw * 0.48) continue;
+
         let st;
         try { st = window.getComputedStyle(el); } catch { continue; }
-        if (!st || st.display === 'none') continue;
+        if (!st || st.display === 'none' || st.visibility === 'hidden') continue;
+        // Never strip floating dropdown menus/popovers overlapping the top zone
+        if ((st.position === 'fixed' || st.position === 'absolute') && st.boxShadow && st.boxShadow !== 'none' && r.top >= 24 && r.height >= 48) {
+          continue;
+        }
+
         const radius = parseFloat(st.borderRadius || '0') || 0;
         const hasGrad = hasNeutralGradient(st.backgroundImage);
         const rgba = parseRgba(st.backgroundColor);
         const isTopRightZone = r.right >= vw - 260;
 
-        if (el.tagName === 'BUTTON') {
-          if (!isTopRightZone) continue;
-          if (rgba && rgba.a >= 0.45 && isNeutralColor(rgba) && (luminance(rgba) < 0.36 || luminance(rgba) > 0.85)) {
-            writes.push([el, radius >= 6 ? 'header-pill' : 'header-clean']);
+        if (rgba && rgba.a >= 0.65 && !isNeutralColor(rgba)) {
+          // Saturated colored accent badge/button in header -> keep native bg & contrast
+          if (el.tagName === 'BUTTON' || el.getAttribute('role') === 'button') {
+            preserveFg.push(el);
           }
           continue;
         }
-        if (hasGrad || (rgba && rgba.a >= 0.65 && isNeutralColor(rgba))) {
-          if (!hasGrad && radius >= 10 && isTopRightZone && r.width <= 120) {
+
+        const isClashingNeutral = Boolean(rgba && rgba.a >= 0.35 && isNeutralColor(rgba) && (luminance(rgba) < 0.38 || luminance(rgba) > 0.78));
+        const isOpaqueNeutral = Boolean(rgba && rgba.a >= 0.65 && isNeutralColor(rgba));
+        const role = el.getAttribute('role') || '';
+
+        if (el.tagName === 'BUTTON' || role === 'tab') {
+          if (!isGlass && !isTopRightZone) continue;
+          if (hasGrad || isOpaqueNeutral || isClashingNeutral) {
+            writes.push([el, !hasGrad && radius >= 6 && r.width <= 320 ? 'header-pill' : 'header-clean']);
+          }
+          continue;
+        }
+
+        if (el.tagName === 'INPUT' || el.getAttribute('contenteditable') === 'true') {
+          if (!isGlass) continue;
+          // Preserve unfocused omnibox inputs whose native color is intentionally transparent (formatted URL overlay sits above them!)
+          const isFocused = document.activeElement === el;
+          const fgRgba = parseRgba(st.color);
+          if (!isFocused && fgRgba && fgRgba.a > 0.05) {
+            visibleInputs.push(el);
+          }
+          if (hasGrad || isOpaqueNeutral || isClashingNeutral) {
             writes.push([el, 'header-pill']);
-          } else if (hasGrad || radius < 10) {
+          }
+          continue;
+        }
+
+        if (hasGrad || isOpaqueNeutral || (isGlass && isClashingNeutral)) {
+          const isUrlPillWrapper = isGlass && !hasGrad && radius >= 6 && r.height <= 44 && Boolean(el.querySelector('input, [contenteditable="true"]')) && !el.querySelector('[role="tablist"]');
+          const isRoundedChromePill = isGlass && !hasGrad && radius >= 8 && r.top >= 28 && r.height >= 20 && r.height <= 40 && r.width <= vw * 0.55 && !el.querySelector('[role="tablist"]');
+          const isTabPillWrapper = isGlass && !hasGrad && radius >= 6 && r.height <= 42 && r.width <= 280 && Boolean(el.closest('[role="tablist"]'));
+          const isTopRightPill = !hasGrad && radius >= 10 && isTopRightZone && r.width <= 120 && r.height <= 44;
+          if (isUrlPillWrapper || isRoundedChromePill || isTabPillWrapper || isTopRightPill) {
+            writes.push([el, 'header-pill']);
+          } else {
             writes.push([el, 'header-clean']);
           }
         }
+      }
+
+      for (const el of preserveFg) {
+        if (el.getAttribute('data-ag-preserve-fg') !== '1') el.setAttribute('data-ag-preserve-fg', '1');
+      }
+      for (const el of visibleInputs) {
+        if (el.getAttribute('data-ag-visible-input') !== '1') el.setAttribute('data-ag-visible-input', '1');
       }
       for (const [el, val] of writes) {
         if (el.getAttribute('data-ag-surface') !== val) el.setAttribute('data-ag-surface', val);
@@ -997,18 +1316,19 @@
       const vw = window.innerWidth || 1280;
       const vh = window.innerHeight || 800;
 
-      // 0. Always identify & protect native opaque overlays (e.g. Settings modal/sheet) FIRST
+      // 0. Always identify & protect native opaque overlays (e.g. Settings modal/sheet, code editors, terminals) FIRST
       scanNativeOverlays(vw, vh);
 
       if (p.renderMode !== 'glass') {
         clearSurfaceTags(false);
         scanNativeOverlays(vw, vh);
+        const holeInfo = syncBrowserHoleCutout();
         const rootEl = document.getElementById('root') || document.body;
         if (rootEl) rootEl.setAttribute('data-ag-chat-root', '1');
         // Tag left sidebar in overlay mode so textTone / userBubble rules cleanly exclude sidebar items
         const overlaySidebars = findLeftSidebarElements(vw, vh);
         for (const sb of overlaySidebars) sb.setAttribute('data-ag-sidebar', '1');
-        scanHeaderClean(rootEl, vw);
+        scanHeaderClean(rootEl, vw, false, holeInfo);
         scanInputBox(p);
         scanUserBubbles(vw);
         syncTriggerButton();
@@ -1017,6 +1337,9 @@
 
       // Incrementally prune only stale structural tags instead of tearing down active backdrop-filter layers
       pruneStaleStructuralTags(vw, vh);
+
+      // Sync live [data-browser-hole] cutout & transparent hole ancestor chain
+      const holeInfo = syncBrowserHoleCutout();
 
       // 1. Safely elevate ONLY the real non-fixed app shell direct child of body (NEVER fixed pets/modals/portals!)
       if (document.body) {
@@ -1112,11 +1435,14 @@
         const holdsInput = Boolean(inputBox && el.contains(inputBox));
         const isEdgeDocked = rect.left < 68 || rect.right > vw - 68;
 
-        // Large canvas wrappers (main shell, chat area) -> transparent so wallpaper shines through
-        if ((wRatio >= 0.48 && hRatio >= 0.45) || (holdsInput && wRatio >= 0.28 && hRatio >= 0.35)) {
+        const holdsHole = Boolean(el.querySelector(BROWSER_HOLE_SEL));
+        const holdsEditor = Boolean(el.querySelector('.monaco-editor, .cm-editor, .xterm'));
+
+        // Large canvas wrappers (main shell, chat area, browser hole containers) -> transparent so wallpaper / browser hole shines through
+        if (holdsHole || (!holdsEditor && ((wRatio >= 0.48 && hRatio >= 0.45) || (holdsInput && wRatio >= 0.20 && hRatio >= 0.35)))) {
           el.setAttribute('data-ag-surface', 'canvas');
         } else if (
-          !holdsInput && (
+          !holdsInput && !holdsHole && !holdsEditor && (
             tag === 'ASIDE' ||
             tag === 'NAV' ||
             tag === 'HEADER' ||
@@ -1132,6 +1458,7 @@
       // Also tag the persistent main chat pane wrapper (outermost ancestor excluding left sidebar) with data-ag-main-pane="1"
       // so newly-mounted cold conversation loading/bottom wrappers are 0ms transparent via pure CSS!
       const knownSidebars = findLeftSidebarElements(vw, vh);
+      const minChatW = Math.max(200, vw * 0.20);
       const chatAnchors = [
         inputBox,
         ...Array.from(document.querySelectorAll('[data-testid="conversation-view"]'))
@@ -1145,10 +1472,10 @@
         for (let up = 0; anc && up < 18 && anc !== document.body && anc !== document.documentElement; up++) {
           if (!isProtectedElement(anc)) {
             const ar = anc.getBoundingClientRect();
-            if (ar.width >= vw * 0.38 && ar.height >= vh * 0.35) {
+            if (ar.width >= minChatW && ar.height >= vh * 0.35) {
               anc.setAttribute('data-ag-surface', 'canvas');
               const holdsSidebar = knownSidebars.some((sb) => anc === sb || anc.contains(sb));
-              if (!holdsSidebar && ar.width >= vw * 0.42 && ar.height >= vh * 0.5) {
+              if (!holdsSidebar && ar.width >= minChatW && ar.height >= vh * 0.5) {
                 persistentMainPane = anc;
               }
               // Also clear any large sibling containers and their large inner scroll viewports (e.g. message scroll area above inputBox)
@@ -1156,16 +1483,18 @@
                 for (let c = 0; c < anc.children.length; c++) {
                   const sib = anc.children[c];
                   if (sib === inputBox || (inputBox && sib.contains(inputBox)) || isProtectedElement(sib)) continue;
+                  if (sib.querySelector && sib.querySelector('.monaco-editor, .cm-editor, .xterm')) continue;
                   const sr = sib.getBoundingClientRect();
-                  if (sr.width >= vw * 0.38 && sr.height >= vh * 0.25) {
+                  if (sr.width >= minChatW && sr.height >= vh * 0.25) {
                     sib.setAttribute('data-ag-surface', 'canvas');
                     const innerScrolls = sib.querySelectorAll('div, main, section');
                     const innerLim = Math.min(innerScrolls.length, 180);
                     for (let k = 0; k < innerLim; k++) {
                       const inEl = innerScrolls[k];
                       if (isProtectedElement(inEl) || inEl.closest('pre, table, [data-ag-surface="user-bubble"]')) continue;
+                      if (inEl.querySelector && inEl.querySelector('.monaco-editor, .cm-editor, .xterm')) continue;
                       const ir = inEl.getBoundingClientRect();
-                      if (ir.width >= vw * 0.38 && ir.height >= vh * 0.25) {
+                      if (ir.width >= minChatW && ir.height >= vh * 0.25) {
                         inEl.setAttribute('data-ag-surface', 'canvas');
                       }
                     }
@@ -1210,11 +1539,13 @@
           const wRatio = rect.width / vw;
           const hRatio = rect.height / vh;
           const holdsInput = Boolean(inputBox && el.contains(inputBox));
+          const holdsHole = Boolean(el.querySelector(BROWSER_HOLE_SEL));
+          const holdsEditor = Boolean(el.querySelector('.monaco-editor, .cm-editor, .xterm'));
           const isEdgeDocked = rect.left < 68 || rect.right > vw - 68;
           if (el.closest('pre, code, table, [data-ag-surface="user-bubble"]')) continue;
-          if ((wRatio >= 0.48 && hRatio >= 0.45) || (holdsInput && wRatio >= 0.28 && hRatio >= 0.35)) {
+          if (holdsHole || (!holdsEditor && ((wRatio >= 0.48 && hRatio >= 0.45) || (holdsInput && wRatio >= 0.20 && hRatio >= 0.35)))) {
             el.setAttribute('data-ag-surface', 'canvas');
-          } else if (!holdsInput && isEdgeDocked && rect.width >= 150 && rect.width <= 560 && hRatio >= 0.5) {
+          } else if (!holdsInput && !holdsHole && !holdsEditor && isEdgeDocked && rect.width >= 150 && rect.width <= 560 && hRatio >= 0.5) {
             el.setAttribute('data-ag-surface', 'panel');
           }
         }
@@ -1288,8 +1619,8 @@
         }
       }
 
-      // 7. Clean small opaque black wrappers & horizontal fade gradients in top titlebar / header icons (top <= 96px)
-      scanHeaderClean(rootEl, vw);
+      // 7. Clean opaque top chrome strips (titlebar, chat header, side-pane tab bar, browser URL bar) & top-right icons
+      scanHeaderClean(rootEl, vw, true, holeInfo);
 
       // Ensure at least one chat root is tagged for textTone / textShadow rules
       if (rootEl && !document.querySelector('[data-ag-surface="canvas"]')) {
@@ -1744,12 +2075,23 @@
       html[data-ag-theme-active="glass"] [data-ag-sidebar="1"] :has(> [data-project-card="true"]) > :not([data-project-card="true"]) :is(div, span) {
         background-image: none !important;
       }
+      html[data-ag-theme-active="glass"] [data-browser-hole]:not([data-browser-hole="false"]):not([data-browser-hole=""]) {
+        background-color: transparent !important;
+        background-image: none !important;
+        backdrop-filter: none !important;
+        -webkit-backdrop-filter: none !important;
+      }
       html[data-ag-theme-active] [data-ag-surface="header-clean"] {
         background-color: transparent !important;
         background-image: none !important;
       }
       html[data-ag-theme-active] [data-ag-surface="header-pill"] {
         background-color: var(--ag-glass-sidebar-pill) !important;
+        background-image: none !important;
+        border-color: var(--ag-chat-pill-border) !important;
+      }
+      html[data-ag-theme-active] [data-ag-surface="header-pill"] input {
+        background-color: transparent !important;
         background-image: none !important;
       }
       html[data-ag-theme-active] [data-ag-surface="header-pill"]:hover {
@@ -2779,7 +3121,7 @@
         // Wallpaper brightness opposes native app theme (e.g. Dark Mode + bright white wallpaper -> auto dark text!)
         tone = dark ? 'light' : 'dark';
       }
-      const includeGlassPanels = isGlass && p.panelAlpha < 0.62;
+      const includeGlassPanels = isGlass && (dark !== state.isDark || p.panelAlpha < 0.62);
       const scope = 'html[data-ag-theme-active] :is([data-ag-surface="canvas"], [data-ag-chat-root="1"], [data-testid="conversation-view"], [data-testid="planner-response-text"])';
       const panelExclude = includeGlassPanels ? '' : ':not([data-ag-sidebar="1"]):not([data-ag-sidebar="1"] *):not([data-ag-surface="panel"]):not([data-ag-surface="panel"] *)';
       const nativeOverlaySel = '[data-ag-native-surface="1"], dialog, [role="dialog"], [role="alertdialog"], [aria-modal="true"], [role="menu"], [role="listbox"], [role="tooltip"], [data-radix-popper-content-wrapper], [data-floating-ui-portal]';
@@ -2802,6 +3144,12 @@
           // Hard inheritance firewall at the boundary of every native modal / settings view / popover menu
           `html[data-ag-theme-active] :is(${nativeOverlaySel}) { color: ${nativeFg} !important; -webkit-text-fill-color: currentColor !important; text-shadow: none !important; }`
         );
+        if (isGlass) {
+          lines.push(
+            `html[data-ag-theme-active="glass"] :is([data-ag-surface="header-clean"], [data-ag-surface="header-pill"])${nativeOverlayExclude}:not([data-ag-preserve-fg="1"]):not(input), html[data-ag-theme-active="glass"] :is([data-ag-surface="header-clean"], [data-ag-surface="header-pill"])${nativeOverlayExclude}:is(input:focus, input[data-ag-visible-input="1"]), html[data-ag-theme-active="glass"] :is([data-ag-surface="header-clean"], [data-ag-surface="header-pill"])${nativeOverlayExclude} :is(span, div, p, a, button, svg, label, code, input:focus, input[data-ag-visible-input="1"])${nativeOverlayExclude}:not([data-ag-preserve-fg="1"]):not([data-ag-preserve-fg="1"] *):not([id*="neko"] *):not([id^="ag-theme-studio-"] *) { color: ${textColor} !important; caret-color: ${textColor} !important; }`,
+            `html[data-ag-theme-active="glass"] :is([data-ag-surface="header-clean"], [data-ag-surface="header-pill"]) input::placeholder { color: ${placeholderColor} !important; opacity: 1 !important; }`
+          );
+        }
         if (includeGlassPanels) {
           lines.push(
             `html[data-ag-theme-active="glass"] :is([data-ag-sidebar="1"], [data-ag-surface="panel"])${nativeOverlayExclude} :is(p, li, h1, h2, h3, h4, h5, h6, td, th, blockquote, strong, em, summary, figcaption, span, div, code, pre, a, button, svg)${nativeOverlayExclude}:not([id*="neko"] *):not([id^="ag-theme-studio-"] *) { color: ${textColor} !important; }`
@@ -2930,6 +3278,7 @@
           : 'radial-gradient(ellipse at center, transparent 54%, rgba(124, 58, 237, 0.08) 100%)';
         vig.style.opacity = p.vignette ? '1' : '0';
       }
+      syncBrowserHoleCutout();
     }
 
     function stopVideoSampleLoop() {
@@ -4532,6 +4881,7 @@
           if (document.hidden) return;
           let hasStructuralChange = false;
           let hasConversationMount = false;
+          let hasHoleChange = false;
           let hasIncrementalBubbleMount = false;
           const vw = window.innerWidth || 1280;
           const vh = window.innerHeight || 800;
@@ -4556,6 +4906,11 @@
                     requestAnimationFrame(() => scanClashingChatControls(n, false));
                   }
                   continue;
+                }
+
+                if (n.hasAttribute('data-browser-hole') || (n.querySelector && n.querySelector('[data-browser-hole]'))) {
+                  hasHoleChange = true;
+                  hasStructuralChange = true;
                 }
 
                 const tid = n.getAttribute('data-testid') || '';
@@ -4598,14 +4953,22 @@
                 }
               }
             }
-            if (!hasStructuralChange && m.removedNodes && m.removedNodes.length > 0) {
+            if (m.removedNodes && m.removedNodes.length > 0) {
               for (const n of m.removedNodes) {
-                if (n.nodeType === 1 && (n.getAttribute('data-ag-native-surface') === '1' || n.getAttribute('role') === 'dialog' || n.getAttribute('role') === 'menu')) {
+                if (n.nodeType !== 1) continue;
+                if (n.hasAttribute('data-browser-hole') || (n.querySelector && n.querySelector('[data-browser-hole]'))) {
+                  hasHoleChange = true;
                   hasStructuralChange = true;
                   break;
                 }
+                if (!hasStructuralChange && (n.getAttribute('data-ag-native-surface') === '1' || n.getAttribute('role') === 'dialog' || n.getAttribute('role') === 'menu')) {
+                  hasStructuralChange = true;
+                }
               }
             }
+          }
+          if (hasHoleChange) {
+            syncBrowserHoleCutout();
           }
           if (hasIncrementalBubbleMount && !hasStructuralChange) {
             scheduleIncrementalAddedScan();
@@ -4614,7 +4977,7 @@
             // Bypass 120ms throttle immediately when switching/loading a cold conversation so bottom black strip NEVER flashes!
             fastConversationSwitchPass(hasConversationMount);
             // Debounce full scan to 380ms so side-pane open/close width animations stay butter-smooth!
-            scheduleSurfaceScan(hasConversationMount ? 160 : 380);
+            scheduleSurfaceScan(hasHoleChange ? 60 : (hasConversationMount ? 160 : 380));
           }
         });
         domMo.observe(document.documentElement, {
@@ -4622,7 +4985,19 @@
           subtree: true
         });
 
+        // Dedicated ultra-low-noise observer strictly for Antigravity's [data-browser-hole] attribute toggles
+        const holeAttrMo = new MutationObserver(() => {
+          scheduleHoleCutoutSync();
+          scheduleSurfaceScan(60);
+        });
+        holeAttrMo.observe(document.documentElement, {
+          attributes: true,
+          subtree: true,
+          attributeFilter: ['data-browser-hole']
+        });
+
         window.addEventListener('resize', () => {
+          scheduleHoleCutoutSync();
           if (state.resizeSampleTimer) clearTimeout(state.resizeSampleTimer);
           state.resizeSampleTimer = setTimeout(() => {
             state.resizeSampleTimer = null;
@@ -4630,6 +5005,13 @@
           }, 180);
           scheduleSurfaceScan(260);
         });
+
+        // Smooth 60fps browser-hole cutout tracking while dragging a split-pane divider (zero cost when idle or no browser tab open)
+        window.addEventListener('pointermove', (e) => {
+          if (state.hasActiveBrowserHole && e && e.buttons > 0) {
+            scheduleHoleCutoutSync();
+          }
+        }, { capture: true, passive: true });
 
         // Ultra-fast viewport-bounded user-bubble tagging during chat scrolling (O(visible unchecked bubbles))
         let lastScrollScanAt = 0;
